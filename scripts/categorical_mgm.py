@@ -61,36 +61,36 @@ import torch.nn.functional as F
 
 
 DEFAULT_TEXTS = (
-    "the moon is bright.",
-    "the moon is quiet.",
-    "the moon is silver.",
-    "the stars are bright.",
-    "the stars are quiet.",
-    "the stars are distant.",
-    "the river runs slowly.",
-    "the river runs softly.",
-    "the river reflects light.",
     "a small bird sings.",
     "a small bird waits.",
     "a small bird flies.",
-    "a warm wind rises.",
-    "a warm wind passes.",
-    "a cool wind returns.",
-    "green leaves move.",
-    "green leaves shimmer.",
-    "gold leaves fall.",
-    "morning light arrives.",
-    "morning rain arrives.",
-    "evening light fades.",
-    "soft rain begins.",
-    "soft rain continues.",
-    "soft rain ends.",
-    "the garden is still.",
-    "the garden is green.",
-    "the garden smells sweet.",
-    "clouds cross the sky.",
-    "birds cross the sky.",
-    "light fills the sky.",
+    "the moon is bright.",
+    # "the moon is silver.",
+    # "the moon is quiet.",
+    # "the stars are bright.",
+    # "the stars are quiet.",
+    # "the stars are distant.",
+    # "the river runs slowly.",
+    # "the river runs softly.",
+    # "the river reflects light.",
+    # "a warm wind rises.",
+    # "a warm wind passes.",
+    # "a cool wind returns.",
+    # "green leaves move.",
+    # "green leaves shimmer.",
+    # "gold leaves fall.",
+    # "morning light arrives.",
+    # "morning rain arrives.",
+    # "evening light fades.",
+    # "soft rain begins.",
+    # "soft rain continues.",
+    # "soft rain ends.",
+    # "the garden is still.",
+    # "the garden is green.",
+    # "the garden smells sweet.",
+    # "clouds cross the sky.",
+    # "birds cross the sky.",
+    # "light fills the sky.",
 )
 
 
@@ -107,14 +107,14 @@ class Config:
     dropout: float = 0.0
 
     batch_size: int = 128
-    n_steps: int = 20_000
-    critic_steps_per_gen: int = 5
-    lr_critic: float = 2e-4
-    lr_gen: float = 2e-4
+    n_steps: int = 100_000
+    critic_steps_per_gen: int = 1
+    lr_critic: float = 1e-4
+    lr_gen: float = 1e-4
     grad_clip: float = 1.0
 
     critic_loss: str = "ce"       # "ce" or "mse"
-    gen_grad: str = "stopped"     # "stopped" or "full"
+    gen_grad: str = "full"     # "stopped" or "full"
 
     # Real endpoint noise.  "smooth" keeps the endpoint on the simplex;
     # "replace" randomly replaces tokens and keeps the endpoint one-hot.
@@ -122,8 +122,8 @@ class Config:
     real_noise_eps: float = 0.01
 
     # P = softmax(logits / temperature).  Equal endpoints give a fixed temp.
-    temperature_start: float = 1.0
-    temperature_end: float = 1.0
+    temperature_start: float = 2.0
+    temperature_end: float = 2.0
 
     # Sample t in [t_min, t_max].  The second hidden branch uses 1-t.
     t_min: float = 0.0
@@ -212,26 +212,54 @@ class NonlinearHead(nn.Module):
 
 
 class CategoricalGenerator(nn.Module):
-    """One-shot, non-autoregressive generator of token distributions."""
-
-    def __init__(self, cfg: Config, vocab_size: int):
+    def __init__(self, cfg, vocab_size):
         super().__init__()
-        self.seq_len = cfg.max_seq_len
-        self.z_projection = nn.Sequential(
-            nn.Linear(cfg.noise_dim, cfg.d_model),
-            nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.d_model),
-        )
-        self.position = nn.Parameter(
-            torch.randn(1, cfg.max_seq_len, cfg.d_model) / math.sqrt(cfg.d_model)
-        )
-        self.backbone = transformer_stack(
-            cfg.d_model, cfg.n_heads, cfg.n_layers, cfg.dropout
-        )
-        self.output_head = NonlinearHead(cfg.d_model, vocab_size)
 
-    def logits(self, z: torch.Tensor) -> torch.Tensor:
-        hidden = self.z_projection(z).unsqueeze(1) + self.position
+        self.seq_len = cfg.max_seq_len
+        self.d_model = cfg.d_model
+
+        self.z_projection = nn.Sequential(
+            nn.Linear(
+                cfg.noise_dim,
+                2 * cfg.d_model,
+            ),
+            nn.GELU(),
+            nn.Linear(
+                2 * cfg.d_model,
+                cfg.max_seq_len * cfg.d_model,
+            ),
+        )
+
+        self.position = nn.Parameter(
+            torch.randn(
+                1,
+                cfg.max_seq_len,
+                cfg.d_model,
+            ) / math.sqrt(cfg.d_model)
+        )
+
+        self.backbone = transformer_stack(
+            cfg.d_model,
+            cfg.n_heads,
+            cfg.n_layers,
+            cfg.dropout,
+        )
+
+        self.output_head = NonlinearHead(
+            cfg.d_model,
+            vocab_size,
+        )
+
+    def logits(self, z):
+        batch_size = z.shape[0]
+
+        latent_sequence = self.z_projection(z).reshape(
+            batch_size,
+            self.seq_len,
+            self.d_model,
+        )
+
+        hidden = latent_sequence + self.position
         hidden = self.backbone(hidden)
         return self.output_head(hidden)
 
@@ -363,31 +391,27 @@ def sample_time(cfg: Config, batch_size: int, device: torch.device) -> torch.Ten
     return (uniform * (high - low) + low) ** cfg.rho
 
 
-def sample_hidden_observation(
-    real: torch.Tensor,
-    fake: torch.Tensor,
-    cfg: Config,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Construct Y without revealing the symmetric branch or token masks.
-
-    One global hidden branch chooses real-token probability t or 1-t.  Then an
-    independent mask at every sequence position chooses the real or fake
-    endpoint.  This is the categorical analogue of observing x_t or x_(1-t).
-    """
-    batch_size, seq_len, _ = real.shape
+def sample_hidden_observation(real, fake, cfg):
+    batch_size = real.shape[0]
     t = sample_time(cfg, batch_size, real.device)
-    branch = torch.rand(batch_size, 1, 1, device=real.device) < 0.5
-    probability_real = torch.where(branch, t, 1.0 - t)
-    mask = (
-        torch.rand(batch_size, seq_len, 1, device=real.device)
-        < probability_real
-    ).to(real.dtype)
 
-    observation = mask * real + (1.0 - mask) * fake
+    branch = torch.rand(
+        batch_size, 1, 1, device=real.device
+    ) < 0.5
+
+    real_weight = torch.where(
+        branch,
+        t,
+        1.0 - t,
+    )
+
+    observation = (
+        real_weight * real
+        + (1.0 - real_weight) * fake
+    )
+
     displacement = real - fake
     return observation, displacement, t
-
 
 def soft_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Cross entropy supporting one-hot or soft simplex targets."""
@@ -619,27 +643,27 @@ def parse_args() -> Config:
     parser.add_argument("--run-dir", default="experiments/categorical_mgm")
     parser.add_argument("--max-seq-len", type=int, default=32)
     parser.add_argument("--noise-dim", type=int, default=64)
-    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--n-layers", type=int, default=3)
+    parser.add_argument("--n-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--steps", dest="n_steps", type=int, default=20_000)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--steps", dest="n_steps", type=int, default=1000_000)
     parser.add_argument(
-        "--critic-steps", dest="critic_steps_per_gen", type=int, default=5
+        "--critic-steps", dest="critic_steps_per_gen", type=int, default=1
     )
-    parser.add_argument("--lr-critic", type=float, default=2e-4)
-    parser.add_argument("--lr-gen", type=float, default=2e-4)
+    parser.add_argument("--lr-critic", type=float, default=1e-4)
+    parser.add_argument("--lr-gen", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--critic-loss", choices=("ce", "mse"), default="ce")
-    parser.add_argument("--gen-grad", choices=("stopped", "full"), default="stopped")
+    parser.add_argument("--gen-grad", choices=("stopped", "full"), default="full")
     parser.add_argument(
         "--real-noise", choices=("none", "smooth", "replace"), default="smooth"
     )
     parser.add_argument("--real-noise-eps", type=float, default=0.01)
     parser.add_argument("--temperature-start", type=float, default=1.0)
     parser.add_argument("--temperature-end", type=float, default=1.0)
-    parser.add_argument("--t-min", type=float, default=0.0)
+    parser.add_argument("--t-min", type=float, default=0.1)
     parser.add_argument("--t-max", type=float, default=0.5)
     parser.add_argument("--rho", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)

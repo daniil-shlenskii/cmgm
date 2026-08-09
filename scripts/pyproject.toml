@@ -1,0 +1,23 @@
+[project]
+name = "InteractionIsAllYouNeed"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.2.1",
+    "matplotlib>=3.10.8",
+    "numpy<2.3",
+    "requests>=2.32.4",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.16.0",
+    "torch<2.7",
+    "torchvision>=0.21.0",
+    "tqdm>=4.67.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+    "notebook>=7.5.3",
+]

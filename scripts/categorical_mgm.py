@@ -46,6 +46,7 @@ subword tokenizer does not change the MGM objectives.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import random
@@ -111,6 +112,8 @@ class Config:
     lr_critic: float = 1e-4
     lr_gen: float = 1e-4
     grad_clip: float = 1.0
+    # Sampling and checkpoint inference use an EMA copy of the generator.
+    ema_decay: float = 0.999
 
     critic_loss: str = "ce"       # "ce" or "mse"
     gen_grad: str = "full"     # "stopped" or "full"
@@ -128,6 +131,8 @@ class Config:
     t_min: float = 0.0
     t_max: float = 0.5
     rho: float = 1.0
+    # Gaussian observation noise has variance sigma_max * t * (1 - t).
+    sigma_max: float = 0.05
 
     seed: int = 42
     device: str = "auto"
@@ -349,6 +354,10 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("Require 0 <= t_min <= t_max <= 0.5")
     if cfg.rho <= 0.0:
         raise ValueError("rho must be positive")
+    if cfg.sigma_max < 0.0:
+        raise ValueError("sigma_max must be non-negative")
+    if not 0.0 <= cfg.ema_decay < 1.0:
+        raise ValueError("ema_decay must be in [0,1)")
     if not 0.0 <= cfg.real_noise_eps <= 1.0:
         raise ValueError("real_noise_eps must be in [0,1]")
     if cfg.temperature_start <= 0.0 or cfg.temperature_end <= 0.0:
@@ -408,6 +417,11 @@ def sample_hidden_observation(real, fake, cfg):
         real_weight * real
         + (1.0 - real_weight) * fake
     )
+    if cfg.sigma_max > 0.0:
+        noise_variance = cfg.sigma_max * t * (1.0 - t)
+        observation = observation + noise_variance.sqrt() * torch.randn_like(
+            observation
+        )
 
     displacement = real - fake
     return observation, displacement, t
@@ -506,6 +520,23 @@ def set_requires_grad(module: nn.Module, value: bool) -> None:
         parameter.requires_grad_(value)
 
 
+@torch.no_grad()
+def update_ema(
+    averaged: nn.Module,
+    source: nn.Module,
+    decay: float,
+) -> None:
+    """Update averaged parameters and copy non-parameter model state."""
+    for averaged_parameter, source_parameter in zip(
+        averaged.parameters(), source.parameters(), strict=True
+    ):
+        averaged_parameter.mul_(decay).add_(source_parameter, alpha=1.0 - decay)
+    for averaged_buffer, source_buffer in zip(
+        averaged.buffers(), source.buffers(), strict=True
+    ):
+        averaged_buffer.copy_(source_buffer)
+
+
 def train(cfg: Config) -> None:
     validate_config(cfg)
     seed_everything(cfg.seed)
@@ -532,6 +563,8 @@ def train(cfg: Config) -> None:
     )
 
     generator = CategoricalGenerator(cfg, corpus.vocab_size).to(device)
+    generator_ema = copy.deepcopy(generator).requires_grad_(False)
+    generator_ema.eval()
     critic = CategoricalCritic(cfg, corpus.vocab_size).to(device)
     opt_gen = torch.optim.AdamW(generator.parameters(), lr=cfg.lr_gen, betas=(0.0, 0.99))
     opt_critic = torch.optim.AdamW(
@@ -594,6 +627,7 @@ def train(cfg: Config) -> None:
         loss_gen.backward()
         nn.utils.clip_grad_norm_(generator.parameters(), cfg.grad_clip)
         opt_gen.step()
+        update_ema(generator_ema, generator, cfg.ema_decay)
         set_requires_grad(critic, True)
 
         entropy = -(fake.detach() * fake.detach().clamp_min(1e-8).log()).sum(-1).mean()
@@ -609,12 +643,12 @@ def train(cfg: Config) -> None:
 
         if step == 1 or step % cfg.sample_every == 0:
             samples = generate_text(
-                generator, corpus, cfg, device, cfg.n_samples
+                generator_ema, corpus, cfg, device, cfg.n_samples
             )
             write_samples(samples_path, step, samples)
             print("samples:", " | ".join(repr(sample) for sample in samples[:4]))
 
-    final_samples = generate_text(generator, corpus, cfg, device, cfg.n_samples)
+    final_samples = generate_text(generator_ema, corpus, cfg, device, cfg.n_samples)
     write_samples(samples_path, cfg.n_steps, final_samples)
 
     np.savez(
@@ -625,6 +659,7 @@ def train(cfg: Config) -> None:
     torch.save(
         {
             "generator": generator.state_dict(),
+            "generator_ema": generator_ema.state_dict(),
             "critic": critic.state_dict(),
             "config": saved_config,
             "vocabulary": corpus.itos,
@@ -647,13 +682,14 @@ def parse_args() -> Config:
     parser.add_argument("--n-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--steps", dest="n_steps", type=int, default=1000_000)
+    parser.add_argument("--steps", dest="n_steps", type=int, default=100_000)
     parser.add_argument(
         "--critic-steps", dest="critic_steps_per_gen", type=int, default=1
     )
     parser.add_argument("--lr-critic", type=float, default=2e-4)
     parser.add_argument("--lr-gen", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--critic-loss", choices=("ce", "mse"), default="ce")
     parser.add_argument("--gen-grad", choices=("stopped", "full"), default="full")
     parser.add_argument(
@@ -665,6 +701,7 @@ def parse_args() -> Config:
     parser.add_argument("--t-min", type=float, default=0.1)
     parser.add_argument("--t-max", type=float, default=0.5)
     parser.add_argument("--rho", type=float, default=1.0)
+    parser.add_argument("--sigma-max", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--log-every", type=int, default=100)

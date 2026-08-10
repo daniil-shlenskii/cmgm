@@ -6,8 +6,8 @@ python categorical_mgm.py \
   --n-heads 4 \
   --n-layers 3 \
   --dropout 0.0 \
-  --batch-size 128 \
-  --steps 30_000 \
+  --batch-size 256 \
+  --steps 50_000 \
   --critic-steps 1 \
   --lr-critic 2e-4 \
   --lr-gen 1e-4 \
@@ -18,7 +18,7 @@ python categorical_mgm.py \
   --real-noise-eps 0.01 \
   --temperature-start 2.0 \
   --temperature-end 1.0 \
-  --t-min 0.0 \
+  --t-min 0.1 \
   --t-max 0.5 \
   --rho 1.0 \
   --sigma-max 0.05 \

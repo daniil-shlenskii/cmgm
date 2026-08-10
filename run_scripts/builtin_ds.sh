@@ -16,8 +16,8 @@ python categorical_mgm.py \
   --gen-grad full \
   --real-noise smooth \
   --real-noise-eps 0.01 \
-  --temperature-start 1.5 \
-  --temperature-end 0.5 \
+  --temperature-start 2.0 \
+  --temperature-end 1.0 \
   --t-min 0.0 \
   --t-max 0.5 \
   --rho 1.0 \

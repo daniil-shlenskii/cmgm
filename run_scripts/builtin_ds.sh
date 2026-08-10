@@ -1,0 +1,26 @@
+python categorical_mgm.py \
+  --run-dir experiments/builtin \
+  --max-seq-len 64 \
+  --noise-dim 64 \
+  --d-model 96 \
+  --n-heads 4 \
+  --n-layers 3 \
+  --dropout 0.0 \
+  --batch-size 128 \
+  --steps 30_000 \
+  --critic-steps 1 \
+  --lr-critic21e-4 \
+  --lr-gen 1e-4 \
+  --ema-decay 0.999 \
+  --critic-loss ce \
+  --gen-grad full \
+  --real-noise smooth \
+  --real-noise-eps 0.01 \
+  --temperature-start 1.5 \
+  --temperature-end 0.5 \
+  --t-min 0.0 \
+  --t-max 0.5 \
+  --rho 1.0 \
+  --sigma-max 0.05 \
+  --log-every 100 \
+  --sample-every 1000

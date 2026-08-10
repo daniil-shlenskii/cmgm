@@ -1,4 +1,4 @@
-uv run categorical_mgm.py \
+python categorical_mgm.py \
   --dataset text8 \
   --run-dir experiments/text8_l64 \
   --max-seq-len 64 \

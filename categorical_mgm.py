@@ -164,6 +164,7 @@ class Config:
     device: str = "auto"
     log_every: int = 100
     sample_every: int = 1_000
+    save_ckpt_every: int = 5_000
     n_samples: int = 12
 
 
@@ -560,6 +561,8 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("Relaxation temperatures must be positive")
     if cfg.n_steps < 1 or cfg.critic_steps_per_gen < 1:
         raise ValueError("Training step counts must be positive")
+    if cfg.save_ckpt_every < 1:
+        raise ValueError("save_ckpt_every must be positive")
 
 
 def sample_real_endpoint(
@@ -713,6 +716,27 @@ def write_samples(path: Path, step: int, samples: Sequence[str]) -> None:
             handle.write(sample + "\n")
 
 
+def save_checkpoint(
+    path: Path,
+    generator: CategoricalGenerator,
+    generator_ema: CategoricalGenerator,
+    critic: CategoricalCritic,
+    saved_config: dict,
+    vocabulary: Sequence[str],
+) -> None:
+    """Save model weights and metadata using the existing checkpoint format."""
+    torch.save(
+        {
+            "generator": generator.state_dict(),
+            "generator_ema": generator_ema.state_dict(),
+            "critic": critic.state_dict(),
+            "config": saved_config,
+            "vocabulary": vocabulary,
+        },
+        path,
+    )
+
+
 def set_requires_grad(module: nn.Module, value: bool) -> None:
     for parameter in module.parameters():
         parameter.requires_grad_(value)
@@ -852,6 +876,18 @@ def train(cfg: Config) -> None:
             write_samples(samples_path, step, samples)
             print("samples:", " | ".join(repr(sample) for sample in samples[:4]))
 
+        if step % cfg.save_ckpt_every == 0:
+            checkpoint_path = run_dir / f"checkpoint_step_{step}.pt"
+            save_checkpoint(
+                checkpoint_path,
+                generator,
+                generator_ema,
+                critic,
+                saved_config,
+                corpus.itos,
+            )
+            print(f"checkpoint: {checkpoint_path}")
+
     final_samples = generate_text(generator_ema, corpus, cfg, device, cfg.n_samples)
     write_samples(samples_path, cfg.n_steps, final_samples)
 
@@ -860,15 +896,13 @@ def train(cfg: Config) -> None:
         critic=np.asarray(history_critic, dtype=np.float32),
         generator=np.asarray(history_gen, dtype=np.float32),
     )
-    torch.save(
-        {
-            "generator": generator.state_dict(),
-            "generator_ema": generator_ema.state_dict(),
-            "critic": critic.state_dict(),
-            "config": saved_config,
-            "vocabulary": corpus.itos,
-        },
+    save_checkpoint(
         run_dir / "checkpoint.pt",
+        generator,
+        generator_ema,
+        critic,
+        saved_config,
+        corpus.itos,
     )
     print(f"Done in {time.time() - start_time:.1f}s. Results: {run_dir}")
 
@@ -946,6 +980,12 @@ def parse_args() -> Config:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--sample-every", type=int, default=1_000)
+    parser.add_argument(
+        "--save-ckpt-every",
+        type=int,
+        default=5_000,
+        help="Save checkpoint_step_<step>.pt at this iteration interval.",
+    )
     parser.add_argument("--n-samples", type=int, default=12)
     return Config(**vars(parser.parse_args()))
 

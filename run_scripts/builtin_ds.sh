@@ -9,7 +9,7 @@ python categorical_mgm.py \
   --batch-size 128 \
   --steps 30_000 \
   --critic-steps 1 \
-  --lr-critic21e-4 \
+  --lr-critic 2e-4 \
   --lr-gen 1e-4 \
   --ema-decay 0.999 \
   --critic-loss ce \

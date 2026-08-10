@@ -10,16 +10,16 @@ python categorical_mgm.py \
   --batch-size 256 \
   --steps 150000 \
   --critic-steps 1 \
-  --lr-critic 1e-4 \
-  --lr-gen 5e-5 \
+  --lr-critic 2e-4 \
+  --lr-gen 1e-4 \
   --ema-decay 0.9999 \
   --critic-loss ce \
   --gen-grad full \
   --real-noise smooth \
   --real-noise-eps 0.01 \
-  --temperature-start 1.0 \
-  --temperature-end 2.0 \
-  --t-min 0.1 \
+  --temperature-start 1.5 \
+  --temperature-end 0.5 \
+  --t-min 0.0 \
   --t-max 0.5 \
   --rho 1.0 \
   --sigma-max 0.05 \

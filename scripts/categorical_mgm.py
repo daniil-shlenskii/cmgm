@@ -39,8 +39,10 @@ containing one training sequence per line:
 
     python categorical_mgm.py --data-path corpus.txt --critic-loss ce
 
-Text8 has a first-class, memory-efficient mode.  The first run downloads and
-caches the canonical dataset; later runs memory-map the extracted file:
+Text8 has a first-class, memory-efficient mode with its native 27-character
+vocabulary.  The first run downloads and caches the canonical dataset; later
+runs memory-map the extracted file.  Each window contains exactly
+max_seq_len stream characters, with no artificial boundary or padding tokens:
 
     python categorical_mgm.py --dataset text8 --max-seq-len 128
 
@@ -114,6 +116,8 @@ class Config:
     data_path: str | None = None
     data_cache_dir: str = "~/.cache/categorical_mgm"
     run_dir: str = "experiments/categorical_mgm"
+    # Text8 windows contain exactly this many corpus characters.  CharCorpus
+    # retains its existing BOS/content/EOS/PAD fixed-length representation.
     max_seq_len: int = 32
 
     noise_dim: int = 64
@@ -211,23 +215,19 @@ class CharCorpus:
 
 
 class Text8Corpus:
-    """Memory-mapped text8 corpus with on-demand random fixed-length windows."""
-
-    PAD = CharCorpus.PAD
-    BOS = CharCorpus.BOS
-    EOS = CharCorpus.EOS
+    """Memory-mapped continuous text8 stream sampled into raw character windows."""
 
     def __init__(self, path: Path | str, max_seq_len: int):
         path = Path(path).expanduser()
-        if max_seq_len < 3:
-            raise ValueError("max_seq_len must be at least 3")
+        if max_seq_len < 1:
+            raise ValueError("max_seq_len must be at least 1 for text8")
         if not path.is_file():
             raise FileNotFoundError(f"Text8 file not found: {path}")
 
-        self.itos = [self.PAD, self.BOS, self.EOS, *TEXT8_ALPHABET]
+        self.itos = list(TEXT8_ALPHABET)
         self.stoi = {token: index for index, token in enumerate(self.itos)}
         self.max_seq_len = max_seq_len
-        self.content_len = max_seq_len - 2
+        self.content_len = max_seq_len
         self._bytes = np.memmap(path, dtype=np.uint8, mode="r")
         if len(self._bytes) < self.content_len:
             raise ValueError(
@@ -235,8 +235,7 @@ class Text8Corpus:
             )
 
         self._lookup = np.full(256, -1, dtype=np.int16)
-        self._lookup[ord(" ")] = self.stoi[" "]
-        for character in TEXT8_ALPHABET[1:]:
+        for character in TEXT8_ALPHABET:
             self._lookup[ord(character)] = self.stoi[character]
         self._validate_alphabet()
 
@@ -267,25 +266,11 @@ class Text8Corpus:
     ) -> torch.Tensor:
         starts = np.random.randint(0, self.n_examples, size=batch_size)
         offsets = starts[:, None] + np.arange(self.content_len)[None, :]
-        content = self._lookup[self._bytes[offsets]]
-
-        token_ids = torch.empty(
-            batch_size, self.max_seq_len, dtype=torch.long
-        )
-        token_ids[:, 0] = self.stoi[self.BOS]
-        token_ids[:, 1:-1] = torch.from_numpy(content)
-        token_ids[:, -1] = self.stoi[self.EOS]
-        return token_ids.to(device)
+        content = self._lookup[self._bytes[offsets]].copy()
+        return torch.from_numpy(content).long().to(device)
 
     def decode(self, ids: Iterable[int]) -> str:
-        result: list[str] = []
-        for index in ids:
-            token = self.itos[int(index)]
-            if token == self.EOS:
-                break
-            if token not in (self.PAD, self.BOS):
-                result.append(token)
-        return "".join(result)
+        return "".join(self.itos[int(index)] for index in ids)
 
 
 class Corpus(Protocol):
@@ -886,7 +871,8 @@ def parse_args() -> Config:
         choices=("builtin", "text8"),
         default="builtin",
         help=(
-            "Use the tiny built-in/line-based corpus or text8; text8 downloads "
+            "Use the tiny built-in/line-based corpus or continuous text8; "
+            "text8 uses its native 27-character vocabulary and downloads "
             "automatically when --data-path is omitted."
         ),
     )
@@ -904,7 +890,15 @@ def parse_args() -> Config:
         help="Download/extraction cache used when text8 has no --data-path.",
     )
     parser.add_argument("--run-dir", default="experiments/categorical_mgm")
-    parser.add_argument("--max-seq-len", type=int, default=32)
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=32,
+        help=(
+            "Fixed model length.  In text8 mode this is exactly the number of "
+            "stream characters; no BOS, EOS, or PAD tokens are added."
+        ),
+    )
     parser.add_argument("--noise-dim", type=int, default=64)
     parser.add_argument("--d-model", type=int, default=96)
     parser.add_argument("--n-heads", type=int, default=4)

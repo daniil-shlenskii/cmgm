@@ -909,7 +909,7 @@ def parse_args() -> Config:
     parser.add_argument(
         "--critic-steps", dest="critic_steps_per_gen", type=int, default=1
     )
-    parser.add_argument("--lr-critic", type=float, default=2e-4)
+    parser.add_argument("--lr-critic", type=float, default=1e-4)
     parser.add_argument("--lr-gen", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--ema-decay", type=float, default=0.999)
@@ -920,8 +920,8 @@ def parse_args() -> Config:
     )
     parser.add_argument("--real-noise-eps", type=float, default=0.01)
     parser.add_argument("--temperature-start", type=float, default=1.0)
-    parser.add_argument("--temperature-end", type=float, default=4.0)
-    parser.add_argument("--t-min", type=float, default=0.1)
+    parser.add_argument("--temperature-end", type=float, default=1.0)
+    parser.add_argument("--t-min", type=float, default=0.0)
     parser.add_argument("--t-max", type=float, default=0.5)
     parser.add_argument("--rho", type=float, default=1.0)
     parser.add_argument("--sigma-max", type=float, default=0.05)

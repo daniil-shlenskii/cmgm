@@ -27,6 +27,11 @@ The generator always minimizes the original MGM payoff
 
     E[ 2 <f(Y,t), R-P> - ||f(Y,t)||^2 ].
 
+An optional generator cross-entropy regularizer pairs each real endpoint with
+the generated endpoint at the same batch index:
+
+    lambda_ce * CE(R, P),  with lambda_ce=0.15 by default.
+
 Two relaxation gradients are available:
 
   --gen-grad stopped   Stable biased semi-gradient.  Stop P -> Y -> critic,
@@ -137,6 +142,7 @@ class Config:
 
     critic_loss: str = "ce"       # "ce" or "mse"
     gen_grad: str = "full"     # "stopped" or "full"
+    lambda_ce: float = 0.15
 
     # Real endpoint noise.  "smooth" keeps the endpoint on the simplex;
     # "replace" randomly replaces tokens and keeps the endpoint one-hot.
@@ -546,6 +552,8 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("sigma_max must be non-negative")
     if not 0.0 <= cfg.ema_decay < 1.0:
         raise ValueError("ema_decay must be in [0,1)")
+    if cfg.lambda_ce < 0.0:
+        raise ValueError("lambda_ce must be non-negative")
     if not 0.0 <= cfg.real_noise_eps <= 1.0:
         raise ValueError("real_noise_eps must be in [0,1]")
     if cfg.temperature_start <= 0.0 or cfg.temperature_end <= 0.0:
@@ -665,6 +673,9 @@ def generator_objective(
 
     payoff = 2.0 * field * displacement - field.square()
     loss = payoff.sum(dim=-1).mean()
+    if cfg.lambda_ce > 0.0:
+        ce_regularization = -(real * fake.clamp_min(1e-8).log()).sum(-1).mean()
+        loss = loss + cfg.lambda_ce * ce_regularization
     return loss, fake
 
 
@@ -915,6 +926,12 @@ def parse_args() -> Config:
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--critic-loss", choices=("ce", "mse"), default="ce")
     parser.add_argument("--gen-grad", choices=("stopped", "full"), default="full")
+    parser.add_argument(
+        "--lambda-ce",
+        type=float,
+        default=0.0,
+        help="Weight of the generator CE(real, generated) regularizer.",
+    )
     parser.add_argument(
         "--real-noise", choices=("none", "smooth", "replace"), default="smooth"
     )

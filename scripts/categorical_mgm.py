@@ -34,10 +34,15 @@ Two relaxation gradients are available:
   --gen-grad full      Differentiate through both R-P and P -> Y -> critic.
 
 The default corpus is deliberately tiny and built in so the script runs
-without downloads.  For an actual dataset, pass a UTF-8 text file containing
-one training sequence per line:
+without downloads.  For an actual line-based dataset, pass a UTF-8 text file
+containing one training sequence per line:
 
     python categorical_mgm.py --data-path corpus.txt --critic-loss ce
+
+Text8 has a first-class, memory-efficient mode.  The first run downloads and
+caches the canonical dataset; later runs memory-map the extracted file:
+
+    python categorical_mgm.py --dataset text8 --max-seq-len 128
 
 This example uses characters as categories.  Replacing CharCorpus with a
 subword tokenizer does not change the MGM objectives.
@@ -47,18 +52,27 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import random
+import shutil
 import time
+import urllib.request
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Protocol, Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+TEXT8_URL = "https://www.mattmahoney.net/dc/text8.zip"
+TEXT8_MD5 = "3bea1919949baf155f99411df5fada7e"
+TEXT8_SIZE = 100_000_000
+TEXT8_ALPHABET = " abcdefghijklmnopqrstuvwxyz"
 
 DEFAULT_TEXTS = (
     "a small bird sings.",
@@ -96,7 +110,9 @@ DEFAULT_TEXTS = (
 
 @dataclass
 class Config:
+    dataset: str = "builtin"       # "builtin" or "text8"
     data_path: str | None = None
+    data_cache_dir: str = "~/.cache/categorical_mgm"
     run_dir: str = "experiments/categorical_mgm"
     max_seq_len: int = 32
 
@@ -167,6 +183,16 @@ class CharCorpus:
     def vocab_size(self) -> int:
         return len(self.itos)
 
+    @property
+    def n_examples(self) -> int:
+        return len(self.tokens)
+
+    def sample_token_ids(
+        self, batch_size: int, device: torch.device
+    ) -> torch.Tensor:
+        indices = torch.randint(0, len(self.tokens), (batch_size,))
+        return self.tokens[indices].to(device)
+
     def encode(self, text: str) -> list[int]:
         content = [self.stoi[ch] for ch in text[: self.max_seq_len - 2]]
         ids = [self.stoi[self.BOS], *content, self.stoi[self.EOS]]
@@ -182,6 +208,100 @@ class CharCorpus:
             if token not in (self.PAD, self.BOS):
                 result.append(token)
         return "".join(result)
+
+
+class Text8Corpus:
+    """Memory-mapped text8 corpus with on-demand random fixed-length windows."""
+
+    PAD = CharCorpus.PAD
+    BOS = CharCorpus.BOS
+    EOS = CharCorpus.EOS
+
+    def __init__(self, path: Path | str, max_seq_len: int):
+        path = Path(path).expanduser()
+        if max_seq_len < 3:
+            raise ValueError("max_seq_len must be at least 3")
+        if not path.is_file():
+            raise FileNotFoundError(f"Text8 file not found: {path}")
+
+        self.itos = [self.PAD, self.BOS, self.EOS, *TEXT8_ALPHABET]
+        self.stoi = {token: index for index, token in enumerate(self.itos)}
+        self.max_seq_len = max_seq_len
+        self.content_len = max_seq_len - 2
+        self._bytes = np.memmap(path, dtype=np.uint8, mode="r")
+        if len(self._bytes) < self.content_len:
+            raise ValueError(
+                f"Text8 file must contain at least {self.content_len} characters"
+            )
+
+        self._lookup = np.full(256, -1, dtype=np.int16)
+        self._lookup[ord(" ")] = self.stoi[" "]
+        for character in TEXT8_ALPHABET[1:]:
+            self._lookup[ord(character)] = self.stoi[character]
+        self._validate_alphabet()
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.itos)
+
+    @property
+    def n_examples(self) -> int:
+        return len(self._bytes) - self.content_len + 1
+
+    def _validate_alphabet(self) -> None:
+        chunk_size = 1 << 20
+        for offset in range(0, len(self._bytes), chunk_size):
+            chunk = np.asarray(self._bytes[offset : offset + chunk_size])
+            token_ids = self._lookup[chunk]
+            if (token_ids < 0).any():
+                invalid = sorted(
+                    {chr(int(value)) for value in chunk[token_ids < 0]}
+                )
+                raise ValueError(
+                    "Text8 may contain only lowercase a-z and spaces; found "
+                    f"invalid characters: {invalid!r}"
+                )
+
+    def sample_token_ids(
+        self, batch_size: int, device: torch.device
+    ) -> torch.Tensor:
+        starts = np.random.randint(0, self.n_examples, size=batch_size)
+        offsets = starts[:, None] + np.arange(self.content_len)[None, :]
+        content = self._lookup[self._bytes[offsets]]
+
+        token_ids = torch.empty(
+            batch_size, self.max_seq_len, dtype=torch.long
+        )
+        token_ids[:, 0] = self.stoi[self.BOS]
+        token_ids[:, 1:-1] = torch.from_numpy(content)
+        token_ids[:, -1] = self.stoi[self.EOS]
+        return token_ids.to(device)
+
+    def decode(self, ids: Iterable[int]) -> str:
+        result: list[str] = []
+        for index in ids:
+            token = self.itos[int(index)]
+            if token == self.EOS:
+                break
+            if token not in (self.PAD, self.BOS):
+                result.append(token)
+        return "".join(result)
+
+
+class Corpus(Protocol):
+    itos: list[str]
+
+    @property
+    def vocab_size(self) -> int: ...
+
+    @property
+    def n_examples(self) -> int: ...
+
+    def sample_token_ids(
+        self, batch_size: int, device: torch.device
+    ) -> torch.Tensor: ...
+
+    def decode(self, ids: Iterable[int]) -> str: ...
 
 
 def transformer_stack(
@@ -331,6 +451,87 @@ def load_texts(data_path: str | None) -> list[str]:
     return path.read_text(encoding="utf-8").splitlines()
 
 
+def file_md5(path: Path) -> str:
+    # MD5 is the checksum published with text8 and is not used for security.
+    digest = hashlib.md5(usedforsecurity=False)
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_text8(cache_dir: str) -> Path:
+    """Download, verify, and extract the canonical text8 corpus if necessary."""
+    cache_path = Path(cache_dir).expanduser()
+    cache_path.mkdir(parents=True, exist_ok=True)
+    text_path = cache_path / "text8"
+    archive_path = cache_path / "text8.zip"
+
+    if text_path.is_file():
+        if (
+            text_path.stat().st_size == TEXT8_SIZE
+            and file_md5(text_path) == TEXT8_MD5
+        ):
+            return text_path
+        raise RuntimeError(
+            f"Cached text8 file failed verification: {text_path}. "
+            "Remove it and rerun to download a clean copy."
+        )
+
+    if not archive_path.is_file():
+        temporary_archive = archive_path.with_suffix(".zip.part")
+        print(f"Downloading text8 from {TEXT8_URL} to {archive_path} ...")
+        request = urllib.request.Request(
+            TEXT8_URL, headers={"User-Agent": "categorical-mgm/1.0"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                with temporary_archive.open("wb") as handle:
+                    shutil.copyfileobj(response, handle)
+            temporary_archive.replace(archive_path)
+        finally:
+            temporary_archive.unlink(missing_ok=True)
+
+    temporary_text = text_path.with_suffix(".part")
+    print(f"Extracting {archive_path} ...")
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            if "text8" not in archive.namelist():
+                raise RuntimeError(
+                    f"Archive does not contain a text8 file: {archive_path}"
+                )
+            with archive.open("text8") as source, temporary_text.open(
+                "wb"
+            ) as target:
+                shutil.copyfileobj(source, target)
+
+        if (
+            temporary_text.stat().st_size != TEXT8_SIZE
+            or file_md5(temporary_text) != TEXT8_MD5
+        ):
+            raise RuntimeError(
+                f"Downloaded text8 failed verification: {archive_path}"
+            )
+        temporary_text.replace(text_path)
+    finally:
+        temporary_text.unlink(missing_ok=True)
+    return text_path
+
+
+def build_corpus(cfg: Config) -> tuple[Corpus, str | None]:
+    if cfg.dataset == "text8":
+        if cfg.data_path is None:
+            data_path = download_text8(cfg.data_cache_dir)
+        else:
+            data_path = Path(cfg.data_path).expanduser()
+            if data_path.is_dir():
+                data_path = data_path / "text8"
+        return Text8Corpus(data_path, cfg.max_seq_len), str(data_path)
+
+    texts = load_texts(cfg.data_path)
+    return CharCorpus(texts, cfg.max_seq_len), cfg.data_path
+
+
 def resolve_device(requested: str) -> torch.device:
     if requested == "auto":
         requested = "cuda" if torch.cuda.is_available() else "cpu"
@@ -348,6 +549,8 @@ def seed_everything(seed: int) -> None:
 
 
 def validate_config(cfg: Config) -> None:
+    if cfg.dataset not in ("builtin", "text8"):
+        raise ValueError(f"Unknown dataset: {cfg.dataset}")
     if cfg.d_model % cfg.n_heads != 0:
         raise ValueError("d_model must be divisible by n_heads")
     if not 0.0 <= cfg.t_min <= cfg.t_max <= 0.5:
@@ -367,24 +570,23 @@ def validate_config(cfg: Config) -> None:
 
 
 def sample_real_endpoint(
-    token_pool: torch.Tensor,
+    corpus: Corpus,
     batch_size: int,
-    vocab_size: int,
+    device: torch.device,
     noise_mode: str,
     noise_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sample token IDs and construct a one-hot/noised simplex endpoint R."""
-    indices = torch.randint(0, token_pool.shape[0], (batch_size,), device=token_pool.device)
-    token_ids = token_pool[indices]
+    token_ids = corpus.sample_token_ids(batch_size, device)
 
     if noise_mode == "replace" and noise_eps > 0.0:
         replace = torch.rand_like(token_ids, dtype=torch.float32) < noise_eps
-        random_ids = torch.randint_like(token_ids, high=vocab_size)
+        random_ids = torch.randint_like(token_ids, high=corpus.vocab_size)
         token_ids = torch.where(replace, random_ids, token_ids)
 
-    endpoint = F.one_hot(token_ids, num_classes=vocab_size).float()
+    endpoint = F.one_hot(token_ids, num_classes=corpus.vocab_size).float()
     if noise_mode == "smooth" and noise_eps > 0.0:
-        endpoint = (1.0 - noise_eps) * endpoint + noise_eps / vocab_size
+        endpoint = (1.0 - noise_eps) * endpoint + noise_eps / corpus.vocab_size
     elif noise_mode not in ("none", "replace", "smooth"):
         raise ValueError(f"Unknown real noise mode: {noise_mode}")
 
@@ -494,7 +696,7 @@ def temperature_at_step(cfg: Config, step: int) -> float:
 @torch.no_grad()
 def generate_text(
     generator: CategoricalGenerator,
-    corpus: CharCorpus,
+    corpus: Corpus,
     cfg: Config,
     device: torch.device,
     n_samples: int,
@@ -527,13 +729,20 @@ def update_ema(
     decay: float,
 ) -> None:
     """Update averaged parameters and copy non-parameter model state."""
+    averaged_parameters = tuple(averaged.parameters())
+    source_parameters = tuple(source.parameters())
+    averaged_buffers = tuple(averaged.buffers())
+    source_buffers = tuple(source.buffers())
+    if len(averaged_parameters) != len(source_parameters):
+        raise ValueError("EMA models have different numbers of parameters")
+    if len(averaged_buffers) != len(source_buffers):
+        raise ValueError("EMA models have different numbers of buffers")
+
     for averaged_parameter, source_parameter in zip(
-        averaged.parameters(), source.parameters(), strict=True
+        averaged_parameters, source_parameters
     ):
         averaged_parameter.mul_(decay).add_(source_parameter, alpha=1.0 - decay)
-    for averaged_buffer, source_buffer in zip(
-        averaged.buffers(), source.buffers(), strict=True
-    ):
+    for averaged_buffer, source_buffer in zip(averaged_buffers, source_buffers):
         averaged_buffer.copy_(source_buffer)
 
 
@@ -542,9 +751,7 @@ def train(cfg: Config) -> None:
     seed_everything(cfg.seed)
     device = resolve_device(cfg.device)
 
-    texts = load_texts(cfg.data_path)
-    corpus = CharCorpus(texts, cfg.max_seq_len)
-    token_pool = corpus.tokens.to(device)
+    corpus, resolved_data_path = build_corpus(cfg)
 
     run_dir = Path(cfg.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -554,7 +761,8 @@ def train(cfg: Config) -> None:
     saved_config = asdict(cfg)
     saved_config.update(
         device=str(device),
-        n_real=len(corpus.tokens),
+        resolved_data_path=resolved_data_path,
+        n_real=corpus.n_examples,
         vocab_size=corpus.vocab_size,
         vocabulary=corpus.itos,
     )
@@ -576,7 +784,7 @@ def train(cfg: Config) -> None:
     start_time = time.time()
 
     print(
-        f"device={device}  real={len(corpus.tokens)}  "
+        f"device={device}  dataset={cfg.dataset}  real={corpus.n_examples}  "
         f"shape=({cfg.max_seq_len},{corpus.vocab_size})  "
         f"critic={cfg.critic_loss}  gen_grad={cfg.gen_grad}"
     )
@@ -590,9 +798,9 @@ def train(cfg: Config) -> None:
         critic.train()
         for _ in range(cfg.critic_steps_per_gen):
             _, real = sample_real_endpoint(
-                token_pool,
+                corpus,
                 cfg.batch_size,
-                corpus.vocab_size,
+                device,
                 cfg.real_noise,
                 cfg.real_noise_eps,
             )
@@ -612,9 +820,9 @@ def train(cfg: Config) -> None:
         critic.eval()
         set_requires_grad(critic, False)
         _, real = sample_real_endpoint(
-            token_pool,
+            corpus,
             cfg.batch_size,
-            corpus.vocab_size,
+            device,
             cfg.real_noise,
             cfg.real_noise_eps,
         )
@@ -673,7 +881,28 @@ def parse_args() -> Config:
     parser = argparse.ArgumentParser(
         description="Train a categorical midpoint generative model."
     )
-    parser.add_argument("--data-path", default=None)
+    parser.add_argument(
+        "--dataset",
+        choices=("builtin", "text8"),
+        default="builtin",
+        help=(
+            "Use the tiny built-in/line-based corpus or text8; text8 downloads "
+            "automatically when --data-path is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--data-path",
+        default=None,
+        help=(
+            "UTF-8 file with one sequence per line in builtin mode, or an "
+            "extracted text8 file/directory in text8 mode."
+        ),
+    )
+    parser.add_argument(
+        "--data-cache-dir",
+        default="~/.cache/categorical_mgm",
+        help="Download/extraction cache used when text8 has no --data-path.",
+    )
     parser.add_argument("--run-dir", default="experiments/categorical_mgm")
     parser.add_argument("--max-seq-len", type=int, default=32)
     parser.add_argument("--noise-dim", type=int, default=64)

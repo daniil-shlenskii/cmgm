@@ -759,8 +759,8 @@ def train(cfg: Config) -> None:
     generator_ema = copy.deepcopy(generator).requires_grad_(False)
     generator_ema.eval()
     critic = CategoricalCritic(cfg, corpus.vocab_size).to(device)
-    opt_gen = torch.optim.AdamW(generator.parameters(), lr=cfg.lr_gen, betas=(0.0, 0.99))
-    opt_critic = torch.optim.AdamW(
+    opt_gen = torch.optim.Adam(generator.parameters(), lr=cfg.lr_gen, betas=(0.0, 0.99))
+    opt_critic = torch.optim.Adam(
         critic.parameters(), lr=cfg.lr_critic, betas=(0.0, 0.99)
     )
 

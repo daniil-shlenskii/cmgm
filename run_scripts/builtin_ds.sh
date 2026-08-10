@@ -1,6 +1,6 @@
 python categorical_mgm.py \
   --run-dir experiments/builtin \
-  --max-seq-len 64 \
+  --max-seq-len 32 \
   --noise-dim 64 \
   --d-model 96 \
   --n-heads 4 \

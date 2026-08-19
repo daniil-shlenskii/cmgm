@@ -1,0 +1,42 @@
+name: mgm
+backbone: dit               # placeholder consumed by TrainerBase.__init__;
+                             # MGM.__init__ immediately overwrites self.backbone
+parameterization: mgm
+time_conditioning: True
+T: 0
+causal_attention: False
+ignore_bos: False
+cf_cond_mask_embed: True     # builds DIT_FMLM_PLUS's cond_seg_embed (clean/free tag)
+
+# --- MGM-specific (ported from cmgm/categorical_mgm.py's Config) ---
+noise_dim: 128
+temperature_start: 1.5       # geometric anneal, matches cmgm's text8 run
+temperature_end: 0.5
+critic_loss: mse             # only mse implemented for v1 (see plan)
+gen_grad: full                # full | stopped
+lambda_ce: 0.0
+t_min: 0.0
+t_max: 0.5
+sigma_max: 0.05
+real_noise_eps: 0.01          # smooth R = (1-eps)*onehot + eps/V, cmgm's default
+                                # in BOTH validated scripts (builtin_ds.sh, text8_l64.sh)
+lr_critic: 2e-4
+lr_gen: 1e-4
+adam_beta1: 0.0               # cmgm uses plain Adam(betas=(0.0, 0.99)), not AdamW —
+adam_beta2: 0.99               # see cmgm git history "adamw -> adam"
+grad_clip: 1.0                 # separate from trainer.gradient_clip_val, which must
+                                # stay 0 at the Trainer level under manual optimization
+critic_steps_per_gen: 1
+warmup_steps: 3000             # plain CE denoising warmup before switching to the
+                                # adversarial MGM objective — MGM paper §5.1: their
+                                # best CIFAR-10 result (FID 2.27) uses a 50K-step
+                                # denoising warmup before MGM fine-tuning, NOT
+                                # adversarial training from random init (Table 1a:
+                                # 5K warmup -> FID 6.24 vs 50K -> FID 2.34)
+init_from_ckpt: null           # path to a trained FMLM+/MDLM checkpoint (e.g.
+                                # checkpoints/sudoku_hard.ckpt) to init BOTH generator
+                                # and critic trunks from, instead of/on top of our own
+                                # CE warmup — set warmup_steps=0 when using this
+refinement_threshold: 0.9      # adaptive-confidence sampling: commit a free cell once
+                                # its max-softmax prob clears this, independent of NFE
+                                # budget. Only used when eval passes sampling.steps>1

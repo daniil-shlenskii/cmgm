@@ -1741,6 +1741,10 @@ class MGM(trainer_base.TrainerBase):
         clip_val = float(cfg.grad_clip)
         warmup_steps = int(getattr(cfg, 'warmup_steps', 0) or 0)
         if self.global_step < warmup_steps:
+            # Lightning puts the entire MGM module in train mode.  Keep the
+            # inactive critic deterministic during the generator-only warmup.
+            self.backbone.train()
+            self.critic.eval()
             warmup_loss = self._warmup_step(input_ids, opt_gen, clip_val)
             if self.ema:
                 self.ema.update(self._get_parameters())
@@ -1771,6 +1775,11 @@ class MGM(trainer_base.TrainerBase):
         temperature = self._current_temperature()
 
         # ---- critic step(s): generator detached, fresh z each sub-step ----
+        # The detached generator is a data source in this phase.  Evaluation
+        # mode prevents its dropout masks from adding avoidable noise to the
+        # fake endpoint, while the critic keeps its training-time behaviour.
+        self.backbone.eval()
+        self.critic.train()
         c = self._prepare_step_data(critic_ids)
         Bc = critic_ids.shape[0]
         critic_loss = None
@@ -1796,6 +1805,10 @@ class MGM(trainer_base.TrainerBase):
             opt_critic.step()
 
         # ---- generator step: critic frozen, independent batch + fresh z --
+        # eval() only changes stateful/dropout layers; it does not disable
+        # autograd through the critic input, which the full MGM gradient needs.
+        self.backbone.train()
+        self.critic.eval()
         for p in self.critic.parameters():
             p.requires_grad_(False)
 
@@ -1946,4 +1959,3 @@ class MGM(trainer_base.TrainerBase):
     def on_load_checkpoint(self, checkpoint):
         if self.ema:
             self._pending_ema_state = checkpoint.get('ema', None)
-

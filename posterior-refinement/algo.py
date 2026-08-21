@@ -1,23 +1,24 @@
-import os
 import collections
 import copy
+import functools
 import json
+import math
+import os
 import pickle
-import hydra.utils
 
 import fsspec
+import hydra.utils
 import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
+from entmax import entmax_bisect
+from torch.func import functional_call
+
+import models
 import trainer_base
 import utils
-import math
-import models
-from torch.func import functional_call
 from models.dit import modulate_fused
-import functools
-from entmax import entmax_bisect
 
 
 def stopgrad(x):
@@ -1611,6 +1612,13 @@ class MGM(trainer_base.TrainerBase):
         super()._train_mode()
         self.critic.train()
 
+    def _set_optimization_phase(self, *, generator_active):
+        """Set module modes and gradient eligibility for alternating MGM."""
+        self.backbone.train(generator_active)
+        self.backbone.requires_grad_(generator_active)
+        self.critic.train(not generator_active)
+        self.critic.requires_grad_(not generator_active)
+
     # -- shared helpers -----------------------------------------------------
     def _split_batch(self, input_ids):
         P, S = self.PROMPT_LEN, self.SOL_LEN
@@ -1708,6 +1716,17 @@ class MGM(trainer_base.TrainerBase):
                     seg_ids=seg_ids, x_ids=x_ids, free_mask=free_mask,
                     n_free=n_free, R=R, prompt_onehot=prompt_onehot)
 
+    def _critic_field(self, observation, tau, seg_ids):
+        """Return a field in the categorical simplex's tangent space.
+
+        Both endpoints have unit mass, so the target displacement ``R - P``
+        sums to zero over the vocabulary.  Orthogonally projecting the raw
+        critic output removes an unidentifiable common-mode component without
+        restricting the optimal field.
+        """
+        field = self.critic(observation, tau, seg_ids=seg_ids)
+        return field - field.mean(dim=-1, keepdim=True)
+
     def _build_observation(self, R, P, free_mask, prompt_onehot):
         cfg = self.config.algo
         device = R.device
@@ -1743,8 +1762,7 @@ class MGM(trainer_base.TrainerBase):
         if self.global_step < warmup_steps:
             # Lightning puts the entire MGM module in train mode.  Keep the
             # inactive critic deterministic during the generator-only warmup.
-            self.backbone.train()
-            self.critic.eval()
+            self._set_optimization_phase(generator_active=True)
             warmup_loss = self._warmup_step(input_ids, opt_gen, clip_val)
             if self.ema:
                 self.ema.update(self._get_parameters())
@@ -1778,8 +1796,7 @@ class MGM(trainer_base.TrainerBase):
         # The detached generator is a data source in this phase.  Evaluation
         # mode prevents its dropout masks from adding avoidable noise to the
         # fake endpoint, while the critic keeps its training-time behaviour.
-        self.backbone.eval()
-        self.critic.train()
+        self._set_optimization_phase(generator_active=False)
         c = self._prepare_step_data(critic_ids)
         Bc = critic_ids.shape[0]
         critic_loss = None
@@ -1791,7 +1808,8 @@ class MGM(trainer_base.TrainerBase):
                     c['puzzle_cells'], z, temperature)
             Y_full, tau_full = self._build_observation(
                 c['R'], P_fake, c['free_mask'], c['prompt_onehot'])
-            field = self.critic(Y_full, tau_full, seg_ids=c['seg_ids'])
+            field = self._critic_field(
+                Y_full, tau_full, seg_ids=c['seg_ids'])
             field = field[:, self.PROMPT_LEN:]
             displacement = c['R'] - P_fake
             critic_loss = ((field - displacement) ** 2).sum(-1)
@@ -1807,10 +1825,7 @@ class MGM(trainer_base.TrainerBase):
         # ---- generator step: critic frozen, independent batch + fresh z --
         # eval() only changes stateful/dropout layers; it does not disable
         # autograd through the critic input, which the full MGM gradient needs.
-        self.backbone.train()
-        self.critic.eval()
-        for p in self.critic.parameters():
-            p.requires_grad_(False)
+        self._set_optimization_phase(generator_active=True)
 
         g = self._prepare_step_data(gen_ids)
         Bg = gen_ids.shape[0]
@@ -1823,9 +1838,11 @@ class MGM(trainer_base.TrainerBase):
             g['R'], P_for_obs, g['free_mask'], g['prompt_onehot'])
         if cfg.gen_grad == 'stopped':
             with torch.no_grad():
-                field = self.critic(Y_full, tau_full, seg_ids=g['seg_ids'])
+                field = self._critic_field(
+                    Y_full, tau_full, seg_ids=g['seg_ids'])
         else:
-            field = self.critic(Y_full, tau_full, seg_ids=g['seg_ids'])
+            field = self._critic_field(
+                Y_full, tau_full, seg_ids=g['seg_ids'])
         field = field[:, self.PROMPT_LEN:]
         displacement = g['R'] - P
         payoff = 2.0 * field * displacement - field ** 2
@@ -1841,9 +1858,6 @@ class MGM(trainer_base.TrainerBase):
             self.clip_gradients(opt_gen, gradient_clip_val=clip_val,
                                 gradient_clip_algorithm='norm')
         opt_gen.step()
-
-        for p in self.critic.parameters():
-            p.requires_grad_(True)
 
         # Manual optimization bypasses the automatic `optimizer_step` hook
         # that TrainerBase uses to update EMA, so do it here explicitly.
